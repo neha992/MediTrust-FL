@@ -1,75 +1,57 @@
-"""Orchestrates a single-process simulation. Raw patient rows remain in memory locally."""
+"""Single-process federated coordinator. Patient rows stay local in memory."""
 import json
 import numpy as np
 from meditrust.config import HOSPITALS, TOP_K, TRIM_FRACTION, MAX_F1_DROP
-from meditrust.data.synthetic_generator import generate_hospital_data, generate_validation_set, add_malformed_rows
+from meditrust.data.datasets import load_network, load_heldout, missing_files
 from meditrust.validation.validator import validate_dataset
 from meditrust.federated.local_training import baseline_params, train_update
 from meditrust.federated.compression import compress, reconstruct, payload_stats
 from meditrust.federated.anomaly_detection import inspect_updates
 from meditrust.federated.aggregation import trimmed_mean
 from meditrust.federated.evaluation import evaluate
-from meditrust.security.attack_simulator import attack
+from meditrust.security.attack_simulator import attack, flip_labels
 from meditrust.security.trust_engine import updated_trust
 from meditrust.persistence.database import connect
 
 class SimulationService:
-  def __init__(self, db_path): self.db_path=db_path
+  def __init__(self, db_path, data_dir=None): self.db_path, self.data_dir=db_path, data_dir
   def initialize(self):
     con=connect(self.db_path)
-    for hid,name,shift in HOSPITALS:
-      con.execute("INSERT OR IGNORE INTO hospitals(id,name,dataset_size) VALUES(?,?,?)",(hid,name,240))
-      con.execute("INSERT OR IGNORE INTO trust_history(hospital_id,score,reason) VALUES(?,?,?)",(hid,80,"Initial synthetic network score"))
+    for hid,name,_,_ in HOSPITALS:
+      con.execute("INSERT OR IGNORE INTO hospitals(id,name,dataset_size) VALUES(?,?,?)",(hid,name,0)); con.execute("INSERT OR IGNORE INTO trust_history(hospital_id,score,reason) VALUES(?,?,?)",(hid,80,"Initial score"))
     con.commit(); con.close()
+  def readiness(self): return {"ready":not missing_files(self.data_dir),"missing":missing_files(self.data_dir)}
   def state(self):
-    con=connect(self.db_path)
-    rows=lambda q,args=(): [dict(x) for x in con.execute(q,args).fetchall()]
-    result={"hospitals":rows("SELECT * FROM hospitals ORDER BY id"),"rounds":rows("SELECT * FROM rounds ORDER BY id DESC"),"decisions":rows("SELECT * FROM decisions ORDER BY id DESC"),"metrics":rows("SELECT * FROM metrics ORDER BY id DESC"),"audit":rows("SELECT * FROM audit_events ORDER BY id DESC LIMIT 100")}
-    con.close(); return result
-  def run_round(self, attack_config=None, malformed_hospital=None):
-    self.initialize(); con=connect(self.db_path)
-    previous=con.execute("SELECT * FROM rounds ORDER BY id DESC LIMIT 1").fetchone(); rid=(previous["id"] if previous else 0)+1
-    version=(previous["model_version"] if previous else 0)+1
-    approved_model=con.execute("SELECT * FROM approved_models ORDER BY model_version DESC LIMIT 1").fetchone()
-    baseline=np.asarray(json.loads(approved_model["params"]), dtype=float) if approved_model else baseline_params()
-    validation=generate_validation_set()
-    latest_metric=con.execute("SELECT * FROM metrics WHERE status='APPROVED' ORDER BY id DESC LIMIT 1").fetchone()
-    datasets={}; summaries={}; updates={}; compressed={}; stats={}
-    for hid,name,shift in HOSPITALS:
-      data=generate_hospital_data(hid,shift)
-      if malformed_hospital==hid: data=add_malformed_rows(data)
-      checked, summary=validate_dataset(data); clean=checked[checked.validation_status!="REJECTED"]
-      datasets[hid]=clean; summaries[hid]=summary
-      con.execute("INSERT INTO validation_runs(hospital_id,round_id,total,valid,review,rejected) VALUES(?,?,?,?,?,?)",(hid,rid,summary["total"],summary["valid"],summary["review"],summary["rejected"]))
-      raw=train_update(clean,baseline)
-      attack_label=None
-      if attack_config and attack_config.get("hospital_id")==hid:
-        raw=attack(raw,attack_config["type"],attack_config["strength"]); attack_label=f"SIMULATED {attack_config['type']} x{attack_config['strength']}"
-      payload=compress(raw,TOP_K); updates[hid]=reconstruct(payload); compressed[hid]=attack_label; stats[hid]=payload_stats(raw,payload)
-    decisions=inspect_updates(updates,rid,version,version)
-    approved=[]; contributors=[]
-    for hid, info in decisions.items():
-      label=compressed[hid]
-      info["attack"]=label
-      con.execute("INSERT INTO decisions(round_id,hospital_id,decision,norm,cosine,score,explanation,attack) VALUES(?,?,?,?,?,?,?,?)",(rid,hid,info["decision"],info["norm"],info["cosine"],info["score"],info["explanation"],label))
-      if info["decision"]=="ACCEPTED": approved.append(updates[hid]); contributors.append(hid)
-      hospital=con.execute("SELECT trust FROM hospitals WHERE id=?",(hid,)).fetchone(); score,delta=updated_trust(hospital["trust"],info["decision"],summaries[hid])
-      con.execute("UPDATE hospitals SET trust=?,last_round=? WHERE id=?",(score,rid,hid)); con.execute("INSERT INTO trust_history(hospital_id,score,reason) VALUES(?,?,?)",(hid,score,f"Round {rid}: {info['decision']} ({delta:+.1f})"))
-      con.execute("INSERT INTO audit_events(event_type,hospital_id,round_id,decision,explanation) VALUES(?,?,?,?,?)",("UPDATE_INSPECTED",hid,rid,info["decision"],info["explanation"]))
+    self.initialize(); con=connect(self.db_path); rows=lambda q:[dict(x) for x in con.execute(q).fetchall()]
+    result={"hospitals":rows("SELECT * FROM hospitals ORDER BY id"),"rounds":rows("SELECT * FROM rounds ORDER BY id DESC"),"decisions":rows("SELECT * FROM decisions ORDER BY id DESC"),"metrics":rows("SELECT * FROM metrics ORDER BY id DESC"),"audit":rows("SELECT * FROM audit_events ORDER BY id DESC LIMIT 200")}; con.close(); return result
+  def local_dataset(self,hid): return load_network(self.data_dir)[hid]
+  def run_round(self,attack_config=None):
+    self.initialize(); data=load_network(self.data_dir); heldout=load_heldout(self.data_dir); con=connect(self.db_path)
+    prev=con.execute("SELECT * FROM rounds ORDER BY id DESC LIMIT 1").fetchone(); rid=(prev["id"] if prev else 0)+1; version=(prev["model_version"] if prev else 0)+1
+    model=con.execute("SELECT * FROM approved_models ORDER BY model_version DESC LIMIT 1").fetchone(); baseline=np.asarray(json.loads(model["params"]),float) if model else baseline_params()
+    previous=con.execute("SELECT * FROM metrics WHERE status='APPROVED' ORDER BY id DESC LIMIT 1").fetchone(); updates={}; stats={}; summaries={}; attacks={}; local_metrics={}
+    for hid,_,_,_ in HOSPITALS:
+      checked,summary=validate_dataset(data[hid]); clean=checked[checked.validation_status!="REJECTED"].copy(); summaries[hid]=summary
+      con.execute("INSERT INTO validation_runs(hospital_id,round_id,total,valid,review,rejected) VALUES(?,?,?,?,?,?)",(hid,rid,summary['total'],summary['valid'],summary['review'],summary['rejected']))
+      attack_name=None; train=flip_labels(clean) if attack_config and attack_config.get("hospital_id")==hid and attack_config.get("type")=="label_flip" else clean
+      raw=train_update(train,baseline)
+      if attack_config and attack_config.get("hospital_id")==hid and attack_config.get("type")!="label_flip": raw=attack(raw,attack_config['type'],attack_config['strength']); attack_name=attack_config['type']
+      elif attack_config and attack_config.get("hospital_id")==hid: attack_name="label_flip"
+      payload=compress(raw,TOP_K); updates[hid]=reconstruct(payload); stats[hid]=payload_stats(raw,payload); attacks[hid]=attack_name; local_metrics[hid]=evaluate(baseline,clean)
+      con.execute("UPDATE hospitals SET dataset_size=?,last_round=? WHERE id=?",(len(data[hid]),rid,hid))
+    decisions=inspect_updates(updates,rid,version,version); accepted=[]; contributors=[]
+    for hid,info in decisions.items():
+      info['attack']=attacks[hid]; con.execute("INSERT INTO decisions(round_id,hospital_id,decision,norm,cosine,score,explanation,attack) VALUES(?,?,?,?,?,?,?,?)",(rid,hid,info['decision'],info['norm'],info['cosine'],info['score'],info['explanation'],attacks[hid]))
+      if info['decision']=="ACCEPTED": accepted.append(updates[hid]); contributors.append(hid)
+      old=con.execute("SELECT trust FROM hospitals WHERE id=?",(hid,)).fetchone()['trust']; score,delta=updated_trust(old,info['decision'],summaries[hid]); con.execute("UPDATE hospitals SET trust=? WHERE id=?",(score,hid)); con.execute("INSERT INTO trust_history(hospital_id,score,reason) VALUES(?,?,?)",(hid,score,f"Round {rid}: {info['decision']} ({delta:+.1f})")); con.execute("INSERT INTO audit_events(event_type,hospital_id,round_id,decision,explanation) VALUES(?,?,?,?,?)",("UPDATE_INSPECTED",hid,rid,info['decision'],info['explanation']))
     status="ROLLED_BACK"; metrics=None
-    if approved:
-      agg, trim=trimmed_mean(approved,TRIM_FRACTION); candidate=baseline+agg; metrics=evaluate(candidate,validation)
-      previous_f1=latest_metric["f1"] if latest_metric else evaluate(baseline,validation)["f1"]
-      if metrics["f1"] >= previous_f1-MAX_F1_DROP:
-        status="APPROVED"
-        con.execute("INSERT INTO approved_models(model_version,round_id,params) VALUES(?,?,?)",(version,rid,json.dumps(candidate.tolist())))
-      else: status="ROLLED_BACK"
+    if accepted:
+      aggregate,trim=trimmed_mean(accepted,TRIM_FRACTION); candidate=baseline+aggregate; metrics=evaluate(candidate,heldout); prior=previous['f1'] if previous else evaluate(baseline,heldout)['f1']
+      if metrics['f1']>=prior-MAX_F1_DROP: status="APPROVED"; con.execute("INSERT INTO approved_models(model_version,round_id,params) VALUES(?,?,?)",(version,rid,json.dumps(candidate.tolist())))
       con.execute("INSERT INTO metrics(round_id,model_version,accuracy,precision,recall,f1,status) VALUES(?,?,?,?,?,?,?)",(rid,version,metrics['accuracy'],metrics['precision'],metrics['recall'],metrics['f1'],status))
-    con.execute("INSERT INTO rounds(id,model_version,status,contributors) VALUES(?,?,?,?)",(rid,version,status,json.dumps(contributors)))
-    con.execute("INSERT INTO audit_events(event_type,round_id,decision,explanation) VALUES(?,?,?,?)",("ROUND_COMPLETED",rid,status,f"Contributors: {', '.join(contributors) or 'none'}"))
-    con.commit(); con.close()
-    return {"round_id":rid,"status":status,"decisions":decisions,"metrics":metrics,"compression":stats,"contributors":contributors}
-  def review(self, decision_id, approve):
+    con.execute("INSERT INTO rounds(id,model_version,status,contributors) VALUES(?,?,?,?)",(rid,version,status,json.dumps(contributors))); con.execute("INSERT INTO audit_events(event_type,round_id,decision,explanation) VALUES(?,?,?,?)",("ROUND_COMPLETED",rid,status,f"Contributors: {', '.join(contributors) or 'none'}")); con.commit(); con.close()
+    return {"round_id":rid,"status":status,"decisions":decisions,"metrics":metrics,"compression":stats,"contributors":contributors,"local_metrics":local_metrics}
+  def review(self,decision_id,approve):
     con=connect(self.db_path); d=con.execute("SELECT * FROM decisions WHERE id=?",(decision_id,)).fetchone()
-    if not d or d['decision'] != 'NEEDS REVIEW': raise ValueError("Only pending review updates can be reviewed")
-    result="APPROVED" if approve else "REJECTED"; con.execute("UPDATE decisions SET review=? WHERE id=?",(result,decision_id)); con.execute("INSERT INTO audit_events(event_type,hospital_id,round_id,decision,explanation) VALUES(?,?,?,?,?)",("HUMAN_REVIEW",d['hospital_id'],d['round_id'],result,"Simulated reviewer decision")); con.commit(); con.close()
+    if not d or d['decision']!="NEEDS REVIEW" or d['review']: raise ValueError("Only pending review updates can be reviewed")
+    result="APPROVED" if approve else "REJECTED"; con.execute("UPDATE decisions SET review=? WHERE id=?",(result,decision_id)); con.execute("INSERT INTO audit_events(event_type,hospital_id,round_id,decision,explanation) VALUES(?,?,?,?,?)",("HUMAN_REVIEW",d['hospital_id'],d['round_id'],result,"Authorised simulated reviewer decision")); con.commit(); con.close()

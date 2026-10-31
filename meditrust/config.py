@@ -1,15 +1,19 @@
 from pathlib import Path
 
 SEED = 2026
-FEATURES = ["age", "heart_rate", "systolic_bp", "diastolic_bp", "temperature", "oxygen_saturation", "glucose"]
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+FEATURES = ["age", "bp_systolic", "bp_diastolic", "glucose", "troponin", "heart_rate", "spo2", "crp"]
+TARGET = "target"
 HOSPITALS = [
-    ("A", "General Hospital", 0.00),
-    ("B", "Urban Medical Center", 0.25),
-    ("C", "Regional Hospital", -0.20),
-    ("D", "Community Hospital", 0.10),
-    ("E", "Specialty Medical Center", 0.45),
+    ("A", "General Hospital", "General medicine", "node-1_general_hospital.csv"),
+    ("B", "Urban Medical Center", "Emergency care", "node-2_urban_medical_center.csv"),
+    ("C", "Regional Hospital", "Regional care", "node-3_regional_hospital.csv"),
+    ("D", "Community Hospital", "Community care", "node-4_community_hospital.csv"),
+    ("E", "Specialty Medical Center", "Cardiology", "node-5_specialty_medical_center.csv"),
 ]
-DB_PATH = Path("meditrust.db")
-TOP_K = 8
-TRIM_FRACTION = 0.2
-MAX_F1_DROP = 0.08
+HELDOUT_FILE = "heldout_validation_cohort.csv"
+DB_PATH = ROOT / "meditrust.db"
+TOP_K = 6
+TRIM_FRACTION = .2
+MAX_F1_DROP = .08

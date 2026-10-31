@@ -1,32 +1,23 @@
 # MediTrust FL
 
-Local Streamlit hackathon demonstration of privacy-aware, Byzantine-resilient federated learning for **synthetic** healthcare triage data. It is not clinical software and must never be used for medical decisions.
+MediTrust FL is a local Streamlit demonstration of privacy-aware federated healthcare model security. It is not clinical software, does not use patient-identifying records, and does not guarantee detection of poisoning attacks.
+
+## Dataset contract
+
+Place these CSVs in `data/`: `node-1_general_hospital.csv`, `node-2_urban_medical_center.csv`, `node-3_regional_hospital.csv`, `node-4_community_hospital.csv`, `node-5_specialty_medical_center.csv`, and `heldout_validation_cohort.csv`.
+
+Each needs `patient_id, age, bp_systolic, bp_diastolic, glucose, troponin, heart_rate, spo2, crp, target`. The held-out cohort is loaded only for evaluation. If any source file is absent, the dashboard blocks training and clearly lists it; it never manufactures substitute records.
 
 ## Run
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m pytest -q
+python -m pytest -q -p no:cacheprovider
 streamlit run app.py
 ```
 
-## What it demonstrates
+## Implementation
 
-- Five deterministic, non-IID synthetic hospitals. The risk label is a noisy rule over simulated vital signs and glucose.
-- Local validation rejects malformed values and duplicates before local logistic-regression training.
-- All sites use one documented fixed transform (shared mean/scale) before parameter aggregation, avoiding incompatible locally fitted scalers.
-- Top-K sparsification stores int32 positions and float64 values; the dashboard reports bytes including index cost.
-- Submitted updates are reconstructed then inspected by norm ratio and cohort cosine similarity. `ACCEPTED` enters aggregation; `NEEDS REVIEW` is held for an explicit reviewer; `QUARANTINED` never enters automatic aggregation.
-- Coordinate-wise trimmed mean aggregates accepted vectors. The evaluated candidate is persisted only if its F1 does not fall by more than 0.08 from the current approved model; otherwise the model rolls back.
-- SQLite persists hospitals, validation summaries, rounds, decisions, trust history, metrics, approved parameter vectors, and audit metadata.
+Five local simulated hospitals validate their own data, use one compatible fixed preprocessing transform, train logistic regression locally, and submit Top-K sparse parameter updates. The coordinator reconstructs updates, evaluates norms and cosine similarity, records `ACCEPTED`, `NEEDS REVIEW`, or `QUARANTINED` decisions, and aggregates only accepted updates with coordinate-wise trimmed mean. Candidate models are evaluated on the independent held-out cohort and roll back if F1 falls by more than 0.08.
 
-## Data boundaries and limitations
-
-Raw synthetic patient rows live only in the one-process hospital simulation and are neither saved centrally nor shown in central audit tables. The central SQLite database holds aggregate validation counts, update metadata, and model metadata only. This demonstrates the protocol inside one local process; it is not five separately deployed servers. Top-K compression lowers payload size, not poisoning risk. The simple detection thresholds and trimmed mean do not protect against all coordinated attacks.
-
-## Demo sequence
-
-1. Open **Overview** and run a normal federated round.
-2. Inspect measured compression, decisions, and held-out metrics.
-3. In **Attack Simulator**, select Hospital C, an attack, and a strength, then run a round.
-4. Inspect the actual anomaly measurements, contributors, metrics, and audit log. Use **Security Monitoring** to resolve any review-status update.
+The attack simulator offers sign flip, Gaussian noise, label flip, model replacement, and stealth drift demos. Isolation Forest marks unusual records for review, not as proof of an attack. SQLite stores aggregate validation results, update/security metadata, trust history, rounds, metrics, approved model vectors, and audit events; raw patient rows stay local/in memory.
